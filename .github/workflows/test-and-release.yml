@@ -1,0 +1,146 @@
+name: TEST_AND_RELEASE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  py_test:
+    name: RUN_PYTEST
+    environment: Staging
+    runs-on: miq-stg-gh-runner
+    permissions:
+      id-token: write
+      contents: read
+      checks: write
+      pull-requests: write
+      issues: write
+    env:
+      MIQ_GHA_TOKEN: ${{ secrets.MIQ_GHA_TOKEN }}
+      JIRA_SERVER: ${{ vars.JIRA_SERVER }}
+      JIRA_TOKEN: ${{ secrets.JIRA_TOKEN}}
+
+    steps:
+      - name: GIT_CHECKOUT
+        uses: actions/checkout@v4
+
+      - name: Check disk space and mounts
+        shell: bash
+        run: |
+          echo "===== Disk Space Information ====="
+          df -h
+
+      - name: PYTHON_SETUP
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
+
+      - name: PIP_INSTALL
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+        shell: bash
+
+      - name: TEST_FLASK_APP
+        run: |
+          echo "Testing Flask app..."
+          # Create temporary version files for testing
+          echo "test-version" > app_version.txt
+          echo "test-commit" > commit_id.txt
+          # Run Flask app in the background
+          python app.py &
+          APP_PID=$!
+          # Give it a second to start
+          sleep 2
+          # Test endpoints
+          curl -s http://localhost:8080/health | grep "healthy"
+          HEALTH_STATUS=$?
+          curl -s http://localhost:8080/onboarding | grep "success"
+          ONBOARD_STATUS=$?
+          curl -s http://localhost:8080/offboarding | grep "success"
+          OFFBOARD_STATUS=$?
+          # Kill the Flask app
+          kill $APP_PID
+          # Check all statuses
+          if [ $HEALTH_STATUS -eq 0 ] && [ $ONBOARD_STATUS -eq 0 ] && [ $OFFBOARD_STATUS -eq 0 ]; then
+            echo "✅ Flask app endpoints working correctly"
+            exit 0
+          else
+            echo "❌ One or more Flask app endpoints failed"
+            exit 1
+          fi
+        shell: bash
+
+  staging:
+    name: STG_IMAGE_BUILD
+    environment: staging
+    runs-on: ubuntu-latest
+    needs: py_test
+    permissions:
+      id-token: write
+      contents: read
+    if: success() && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    env:
+      REGISTRY: miqstaging.azurecr.io
+      IMAGE_TAG: staging-${{ github.sha }}-${{ github.run_number }}
+      IMAGE_NAME: test-app
+    outputs:
+      image_tag: ${{ env.IMAGE_TAG }}
+    steps:
+      - name: GIT_CHECKOUT
+        uses: actions/checkout@v4
+        
+      - name: DEBUG_VARS
+        run: |
+          echo "Debugging GitHub Variables"
+          echo "AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID != '' && 'SET' || 'NOT SET' }}"
+          echo "AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID != '' && 'SET' || 'NOT SET' }}"
+          echo "AZURE_SUBSCRIPTION_CLUSTER_ID: ${{ vars.AZURE_SUBSCRIPTION_CLUSTER_ID != '' && 'SET' || 'NOT SET' }}"
+
+      - name: AZURE_LOGIN
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_CLUSTER_ID }}
+
+      - name: ACR_LOGIN
+        run: |
+          REGISTRY_NAME=$(echo ${{ env.REGISTRY }} | cut -d'.' -f1)
+          az acr login --name $REGISTRY_NAME
+
+      - name: AZURE_DOCKER_BUILD
+        run: |
+          echo "APP_VERSION=$(date +'%Y.%m.%d')" >> $GITHUB_ENV
+          echo ${{ env.APP_VERSION }} > app_version.txt
+          echo ${{ github.sha }} > commit_id.txt
+          docker build . -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+      - name: AZURE_DOCKER_PUSH
+        if: steps.CS_SCAN.outputs.exit-code == 0
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+  
+  # Replace the monitor_deployment job with a call to the reusable workflow
+  monitor_deployment:
+    name: FLUXCD
+    needs: staging
+    if: success() && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    uses: ./.github/workflows/fluxcd-deployment-check.yml
+    with:
+      environment: staging
+      app_name: miq-test-app
+      namespace: miq-test-app
+      image_tag: ${{ needs.staging.outputs.image_tag }}
+      registry: miqstaging.azurecr.io
+      image_name: test-app
+      aks_resource_group: miq-staging-internal-tools-aks
+      aks_cluster_name: miq-staging-internal-tools
+      max_attempts: 5
+      sleep_seconds: 20
+      subscription_id: "9ecf6834-7371-4fd1-af5c-1a4e02c55efc" # Hardcoded for testing

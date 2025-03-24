@@ -1,6 +1,7 @@
 from flask import Flask, jsonify
 from subprocess import check_output, STDOUT, CalledProcessError
 from time import gmtime, strftime
+import os
 
 def create_app(config=None):
     app = Flask(__name__)
@@ -21,6 +22,7 @@ def create_app(config=None):
         master_msg = "<br/>{0}<br/>version: {1}<br/>commit: {2}<br/>date: {3}".format(msg_header, app_ver, commit_id, msg_date)
         return master_msg
 
+    @app.route('/health')
     @app.route('/public/health')
     def health():
         msg_date = strftime("%Y-%m-%d %H:%M:%S", gmtime())
@@ -38,6 +40,22 @@ def create_app(config=None):
             uptime=msg_date
         )
 
+    @app.route('/onboarding')
+    def onboarding():
+        return jsonify(
+            status="success",
+            message="Onboarding service is ready",
+            timestamp=strftime("%Y-%m-%d %H:%M:%S", gmtime())
+        )
+
+    @app.route('/offboarding')
+    def offboarding():
+        return jsonify(
+            status="success",
+            message="Offboarding service is ready",
+            timestamp=strftime("%Y-%m-%d %H:%M:%S", gmtime())
+        )
+
     @app.route('/iostat')
     def iostat():
         cmd = ['iostat']
@@ -52,5 +70,7 @@ def create_app(config=None):
     return app
 
 if __name__ == "__main__":
+    # Use environment variable for port, default to 8080 for non-root environments
+    port = int(os.environ.get("PORT", 8080))
     app = create_app()
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=port)

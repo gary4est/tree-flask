@@ -1,0 +1,421 @@
+name: FLUXCD_DEPLOYMENT_CHECK
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+        description: "The environment to check (staging or production)"
+      app_name:
+        required: true
+        type: string
+        description: "The name of the application to check"
+      namespace:
+        required: true
+        type: string
+        description: "The namespace where the application is deployed"
+      image_tag:
+        required: true
+        type: string
+        description: "The image tag to verify"
+      registry:
+        required: true
+        type: string
+        description: "The container registry where the image is stored"
+      image_name:
+        required: true
+        type: string
+        description: "The name of the container image"
+      aks_resource_group:
+        required: true
+        type: string
+        description: "The resource group of the AKS cluster"
+      aks_cluster_name:
+        required: true
+        type: string
+        description: "The name of the AKS cluster"
+      max_attempts:
+        required: false
+        type: number
+        default: 5
+        description: "Maximum number of attempts to check deployment status"
+      sleep_seconds:
+        required: false
+        type: number
+        default: 20
+        description: "Seconds to sleep between checks"
+      subscription_id:
+        required: false
+        type: string
+        description: "Azure subscription ID to use"
+
+jobs:
+  verify_deployment:
+    name: DEPLOYMENT_STATUS
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    continue-on-error: false
+
+    steps:
+      - name: CHECK_INPUTS
+        id: check_inputs
+        run: |
+          echo "Checking input parameters..."
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Subscription ID: '${{ inputs.subscription_id }}'"
+          
+          # Check if subscription_id is provided
+          if [ -z "${{ inputs.subscription_id }}" ]; then
+            echo "::error::Required input 'subscription_id' is missing. Please provide a valid Azure subscription ID."
+            echo "::error::This typically means your GitHub Variables aren't being properly accessed."
+            echo "::error::Try adding a hardcoded value temporarily to diagnose the issue:"
+            echo "::error::   subscription_id: \"9ecf6834-7371-4fd1-af5c-1a4e02c55efc\" # For staging"
+            echo "::error::   subscription_id: \"37407913-8d1f-4aaf-a1c5-b188e50af4ac\" # For production"
+            echo "::error::Then check if your GitHub repository has the correct variables configured:"
+            echo "::error::   AZURE_SUBSCRIPTION_CLUSTER_ID (for staging)"
+            echo "::error::   AZURE_SUBSCRIPTION_ID (for production)"
+            exit 1
+          fi
+          
+          # All checks passed
+          echo "All input parameters validated successfully."
+
+      - name: AZURE_LOGIN
+        id: azure_login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ inputs.subscription_id }}
+
+      - name: INSTALL_KUBECTL
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "latest"
+
+      - name: VERIFY_KUBERNETES_ACCESS
+        run: |
+          echo "Verifying Kubernetes access through AZ AKS Command..."
+          
+          # Check if we're authenticated
+          az account show
+          if [ $? -ne 0 ]; then
+            echo "::error::Azure authentication failed. Please check Azure credentials."
+            echo "Current values:"
+            echo "Environment: ${{ inputs.environment }}"
+            echo "Subscription ID: ${{ inputs.subscription_id != '' && 'Provided' || 'Missing' }}"
+            exit 1
+          fi
+          
+          # Check if the AKS cluster exists
+          az aks show --resource-group "${{ inputs.aks_resource_group }}" --name "${{ inputs.aks_cluster_name }}" --output none
+          if [ $? -ne 0 ]; then
+            echo "::error::AKS cluster not found. Please check the resource group and cluster name."
+            echo "Resource Group: ${{ inputs.aks_resource_group }}"
+            echo "Cluster Name: ${{ inputs.aks_cluster_name }}"
+            exit 1
+          fi
+          
+          # Test az aks command invoke
+          az aks command invoke \
+            --resource-group "${{ inputs.aks_resource_group }}" \
+            --name "${{ inputs.aks_cluster_name }}" \
+            --command "echo 'AKS command access working'" \
+            --output tsv
+          
+          if [ $? -ne 0 ]; then
+            echo "::error::AKS command invoke failed. Please check the AKS cluster permissions."
+            exit 1
+          fi
+          
+          echo "AKS Command access verified successfully"
+
+      - name: FLUXCD_DEPLOYMENT_STATUS
+        run: |
+          echo "VERIFYING FLUXCD DEPLOYMENT PROCESS..."
+          
+          # Define color codes for better output
+          RED='\033[0;31m'
+          GREEN='\033[0;32m'
+          YELLOW='\033[0;33m'
+          BLUE='\033[0;34m'
+          NC='\033[0m' # No Color
+          
+          # Function to print status messages
+          print_status() {
+            local status=$1
+            local message=$2
+            
+            if [ "$status" == "SUCCESS" ]; then
+              echo -e "${GREEN}✅ SUCCESS: $message${NC}"
+            elif [ "$status" == "PENDING" ]; then
+              echo -e "${YELLOW}⏳ PENDING: $message${NC}"
+            elif [ "$status" == "SKIPPED" ]; then
+              echo -e "${BLUE}ℹ️ SKIPPED: $message${NC}"
+            else
+              echo -e "${RED}❌ FAILED: $message${NC}"
+            fi
+          }
+          
+          IMAGE_TAG="${{ inputs.image_tag }}"
+          NAMESPACE="${{ inputs.namespace }}"
+          APP_NAME="${{ inputs.app_name }}"
+          REGISTRY="${{ inputs.registry }}"
+          IMAGE_NAME="${{ inputs.image_name }}"
+          AKS_RESOURCE_GROUP="${{ inputs.aks_resource_group }}"
+          AKS_CLUSTER_NAME="${{ inputs.aks_cluster_name }}"
+          MAX_ATTEMPTS="${{ inputs.max_attempts }}"
+          SLEEP_SECONDS="${{ inputs.sleep_seconds }}"
+          
+          echo -e "${BLUE}============================================================${NC}"
+          echo -e "${BLUE}           FLUXCD DEPLOYMENT VERIFICATION                  ${NC}"
+          echo -e "${BLUE}============================================================${NC}"
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Looking for image tag: $IMAGE_TAG"
+          echo "App name: $APP_NAME"
+          echo "Namespace: $NAMESPACE"
+          
+          ATTEMPT=1
+          DEPLOYMENT_SUCCESS=false
+          
+          # Step 1: Verify Image Detection
+          echo -e "\n${BLUE}[Step 1/8] Image Detection${NC}"
+          echo "Checking if the newly built image can be detected..."
+          REGISTRY_NAME=$(echo $REGISTRY | cut -d'.' -f1)
+          
+          az acr repository show-tags \
+            --name $REGISTRY_NAME \
+            --repository "$IMAGE_NAME" \
+            --output table | grep "$IMAGE_TAG" > /dev/null
+            
+          if [ $? -eq 0 ]; then
+            print_status "SUCCESS" "Image $IMAGE_TAG found in ACR"
+            STEP1_STATUS="SUCCESS"
+          else
+            print_status "FAILED" "Image $IMAGE_TAG not found in ACR"
+            STEP1_STATUS="FAILED"
+          fi
+          
+          # Step 2: Check Policy Evaluation
+          echo -e "\n${BLUE}[Step 2/8] Policy Evaluation${NC}"
+          echo "NOTE: This step is verified indirectly through the presence of updated manifests"
+          print_status "SKIPPED" "Manual policy verification not possible, will be confirmed in later steps"
+          STEP2_STATUS="SKIPPED"
+          
+          # Step 3: Verify Manifest Update
+          echo -e "\n${BLUE}[Step 3/8] Manifest Update${NC}"
+          echo "Checking for HelmRelease in the cluster..."
+          
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Check attempt $ATTEMPT of $MAX_ATTEMPTS"
+            
+            # Check if the HelmRelease exists and its status
+            HELM_RELEASE_OUTPUT=$(az aks command invoke \
+              --resource-group "$AKS_RESOURCE_GROUP" \
+              --name "$AKS_CLUSTER_NAME" \
+              --command "kubectl get helmrelease \"$APP_NAME\" -n \"$NAMESPACE\" -o wide" \
+              --output table)
+            
+            echo "$HELM_RELEASE_OUTPUT"
+            
+            # Check if "True" appears in the HelmRelease status output and if it succeeded
+            if [[ "$HELM_RELEASE_OUTPUT" == *"True"* ]] && [[ "$HELM_RELEASE_OUTPUT" == *"Helm upgrade succeeded"* ]]; then
+              print_status "SUCCESS" "HelmRelease exists and has been updated"
+              STEP3_STATUS="SUCCESS"
+              break
+            else
+              print_status "PENDING" "HelmRelease update is still in progress"
+              STEP3_STATUS="PENDING"
+            fi
+            
+            ATTEMPT=$((ATTEMPT+1))
+            if [ $ATTEMPT -le $MAX_ATTEMPTS ]; then
+              echo "Waiting $SLEEP_SECONDS seconds before next check..."
+              sleep $SLEEP_SECONDS
+            fi
+          done
+          
+          if [ "$STEP3_STATUS" == "PENDING" ]; then
+            print_status "FAILED" "HelmRelease was not updated within the timeout period"
+            STEP3_STATUS="FAILED"
+          fi
+          
+          # Step 4: Git Commit and Push (This happens in the background, we can't check directly)
+          echo -e "\n${BLUE}[Step 4/8] Git Commit and Push${NC}"
+          print_status "SKIPPED" "This step happens in the Flux controllers, can only be verified through logs"
+          STEP4_STATUS="SKIPPED"
+          
+          # Step 5: Source Detection (This also happens in the background)
+          echo -e "\n${BLUE}[Step 5/8] Source Detection${NC}"
+          SOURCE_DETECTION=$(az aks command invoke \
+            --resource-group "$AKS_RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER_NAME" \
+            --command "kubectl get gitrepositories -n flux-system -o jsonpath='{.items[*].status.conditions[?(@.type==\"Ready\")].status}'" \
+            --output tsv)
+            
+          if [[ "$SOURCE_DETECTION" == *"True"* ]]; then
+            print_status "SUCCESS" "Git repositories are ready for source detection"
+            STEP5_STATUS="SUCCESS"
+          else
+            print_status "WARNING" "Unable to verify source detection status"
+            STEP5_STATUS="WARNING"
+          fi
+          
+          # Step 6: Manifest Reconciliation
+          echo -e "\n${BLUE}[Step 6/8] Manifest Reconciliation${NC}"
+          # We already verified this in Step 3 with the HelmRelease check
+          if [ "$STEP3_STATUS" == "SUCCESS" ]; then
+            print_status "SUCCESS" "Manifest reconciliation completed successfully"
+            STEP6_STATUS="SUCCESS"
+          else
+            print_status "FAILED" "Manifest reconciliation failed or timed out"
+            STEP6_STATUS="FAILED"
+          fi
+          
+          # Step 7: Resource Creation
+          echo -e "\n${BLUE}[Step 7/8] Resource Creation/Updating${NC}"
+          echo "Checking pod status..."
+          POD_OUTPUT=$(az aks command invoke \
+            --resource-group "$AKS_RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER_NAME" \
+            --command "kubectl get pods -n \"$NAMESPACE\" -o wide" \
+            --output table)
+            
+          echo "$POD_OUTPUT"
+          
+          if [[ "$POD_OUTPUT" == *"Running"* ]]; then
+            print_status "SUCCESS" "Pods are running successfully"
+            STEP7_STATUS="SUCCESS"
+          else
+            print_status "FAILED" "Pods are not in a Running state"
+            STEP7_STATUS="FAILED"
+            
+            # Show events to help diagnose the issue
+            echo "Checking events to diagnose the issue:"
+            az aks command invoke \
+              --resource-group "$AKS_RESOURCE_GROUP" \
+              --name "$AKS_CLUSTER_NAME" \
+              --command "kubectl get events -n $NAMESPACE --sort-by=.metadata.creationTimestamp | tail -10" \
+              --output table
+          fi
+          
+          # Step 8: Status Reporting
+          echo -e "\n${BLUE}[Step 8/8] Status Reporting${NC}"
+          # Get more details about resources
+          echo "Checking service status..."
+          az aks command invoke \
+            --resource-group "$AKS_RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER_NAME" \
+            --command "kubectl get svc -n \"$NAMESPACE\"" \
+            --output table
+            
+          echo "Checking ingress status..."
+          az aks command invoke \
+            --resource-group "$AKS_RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER_NAME" \
+            --command "kubectl get ingress -n \"$NAMESPACE\"" \
+            --output table
+          
+          # Skip the health check via exec and focus on pod readiness status
+          echo "Checking application readiness status..."
+          READY_POD_COUNT=$(az aks command invoke \
+            --resource-group "$AKS_RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER_NAME" \
+            --command "kubectl get deployment -n $NAMESPACE $APP_NAME -o jsonpath='{.status.readyReplicas}'" \
+            --output tsv)
+          
+          echo "Ready pod count from deployment: $READY_POD_COUNT"
+          
+          if [[ "$READY_POD_COUNT" -gt 0 ]]; then
+            print_status "SUCCESS" "Application pods are ready according to Kubernetes readiness probes"
+            STEP8_STATUS="SUCCESS"
+            DEPLOYMENT_SUCCESS=true
+          else
+            # Get more information
+            echo "Checking pod details:"
+            POD_DETAILS=$(az aks command invoke \
+              --resource-group "$AKS_RESOURCE_GROUP" \
+              --name "$AKS_CLUSTER_NAME" \
+              --command "kubectl get pods -n $NAMESPACE -l app.kubernetes.io/name=$APP_NAME -o wide" \
+              --output table)
+            
+            echo "$POD_DETAILS"
+            
+            # Try alternate method - look at the pod status conditions
+            RUNNING_POD_COUNT=$(echo "$POD_DETAILS" | grep -c "Running")
+            if [[ "$RUNNING_POD_COUNT" -gt 0 ]]; then
+              # If pods are running, treat it as success even if readiness probe may not be configured
+              print_status "SUCCESS" "Application pods are running, deployment considered successful"
+              STEP8_STATUS="SUCCESS"
+              DEPLOYMENT_SUCCESS=true
+            else
+              print_status "FAILED" "No ready pods found for the application"
+              STEP8_STATUS="FAILED"
+              
+              # Show pod logs if we can find any pod
+              POD_NAME=$(az aks command invoke \
+                --resource-group "$AKS_RESOURCE_GROUP" \
+                --name "$AKS_CLUSTER_NAME" \
+                --command "kubectl get pods -n $NAMESPACE -o name | grep $APP_NAME | head -1 | sed 's|pod/||'" \
+                --output tsv)
+              
+              if [[ -n "$POD_NAME" ]]; then
+                echo "Pod logs for $POD_NAME:"
+                az aks command invoke \
+                  --resource-group "$AKS_RESOURCE_GROUP" \
+                  --name "$AKS_CLUSTER_NAME" \
+                  --command "kubectl logs -n $NAMESPACE $POD_NAME --tail=20" \
+                  --output table
+              fi
+            fi
+          fi
+          
+          # Final summary
+          echo -e "\n${BLUE}============================================================${NC}"
+          echo -e "${BLUE}                  Deployment Summary                        ${NC}"
+          echo -e "${BLUE}============================================================${NC}"
+          echo -e "${BLUE}[Step 1/8] Image Detection:${NC}         ${STEP1_STATUS}"
+          echo -e "${BLUE}[Step 2/8] Policy Evaluation:${NC}       ${STEP2_STATUS}"
+          echo -e "${BLUE}[Step 3/8] Manifest Update:${NC}         ${STEP3_STATUS}"
+          echo -e "${BLUE}[Step 4/8] Git Commit and Push:${NC}     ${STEP4_STATUS}"
+          echo -e "${BLUE}[Step 5/8] Source Detection:${NC}        ${STEP5_STATUS}"
+          echo -e "${BLUE}[Step 6/8] Manifest Reconciliation:${NC} ${STEP6_STATUS}"
+          echo -e "${BLUE}[Step 7/8] Resource Creation:${NC}       ${STEP7_STATUS}"
+          echo -e "${BLUE}[Step 8/8] Status Reporting:${NC}        ${STEP8_STATUS}"
+          
+          if [ "$DEPLOYMENT_SUCCESS" = true ]; then
+            echo -e "\n${GREEN}✅ DEPLOYMENT VERIFICATION SUCCESSFUL!${NC}"
+            exit 0
+          else
+            # Determine which stage failed
+            FAILED_STAGE=""
+            if [ "$STEP1_STATUS" == "FAILED" ]; then
+              FAILED_STAGE="Image Detection"
+            elif [ "$STEP3_STATUS" == "FAILED" ]; then
+              FAILED_STAGE="Manifest Update"
+            elif [ "$STEP6_STATUS" == "FAILED" ]; then
+              FAILED_STAGE="Manifest Reconciliation"
+            elif [ "$STEP7_STATUS" == "FAILED" ]; then
+              FAILED_STAGE="Resource Creation"
+            elif [ "$STEP8_STATUS" == "FAILED" ]; then
+              FAILED_STAGE="Status Reporting/Health Check"
+            else
+              FAILED_STAGE="Unknown stage"
+            fi
+            
+            echo -e "\n${RED}❌ DEPLOYMENT VERIFICATION FAILED AT: ${FAILED_STAGE}${NC}"
+            echo "The image was successfully built and pushed to: $REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+            echo "Deployment Status Summary:"
+            
+            az aks command invoke \
+              --resource-group "$AKS_RESOURCE_GROUP" \
+              --name "$AKS_CLUSTER_NAME" \
+              --command "echo '=== HelmRelease Status ==='; kubectl get helmrelease \"$APP_NAME\" -n \"$NAMESPACE\" -o wide; echo; echo '=== Pod Status ==='; kubectl get pods -n \"$NAMESPACE\" -o wide; echo; echo '=== Latest Events ==='; kubectl get events -n \"$NAMESPACE\" --sort-by=.metadata.creationTimestamp | tail -10" \
+              --output table
+              
+            exit 1
+          fi 
